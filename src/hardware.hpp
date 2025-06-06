@@ -50,6 +50,8 @@ public:
 	/// if the cores are currently running. Activated when an
 	/// emergency stop command arrives.
 	void halt_and_reset();
+	void record_log(uint32_t execution_loops, size_t pc, size_t mem_offset, unsigned rx_reads_per_loop, uint32_t exec, size_t pc_hw);
+	void flush_logs();
 private:
 	// Config variables
 	unsigned _pc_tries_limit = 1000000; // how long to wait if PC isn't changing

@@ -7,6 +7,9 @@
 #include <vector>
 #include <sys/mman.h>
 
+
+
+
 #ifdef VERILATOR_BUILD
 #include "marga_model.hpp"
 extern marga_model *mm;
@@ -15,6 +18,7 @@ extern marga_model *mm;
 // variadic macro for debugging enable/disable
 // #define debug_printf(...) printf(__VA_ARGS__)
 #define debug_printf(...)
+#define log_printf(...) printf(__VA_ARGS__)
 
 hardware::hardware() {
 	init_mem();
@@ -22,6 +26,66 @@ hardware::hardware() {
 
 hardware::~hardware() {
 }
+#define MAX_LOG_COUNT 500  // 始终记录最后 500 条
+#define LOG_INTERVAL 1     // 每 N 次记录一次
+
+typedef struct {
+    uint32_t loop;
+    size_t pc;
+    size_t mem_offset;
+    unsigned rx_reads_per_loop;
+    uint32_t exec;       // 新增参数
+    size_t pc_hw;        // 新增参数
+} LogEntry;
+
+LogEntry log_buffer[MAX_LOG_COUNT];
+int log_index = 0;
+bool triggered = false;
+
+void hardware::record_log(uint32_t execution_loops, size_t pc, size_t mem_offset,
+                          unsigned rx_reads_per_loop, uint32_t exec, size_t pc_hw) {
+    if (execution_loops % LOG_INTERVAL != 0) {
+        return;
+    }
+
+    log_buffer[log_index] = (LogEntry){
+        .loop = execution_loops,
+        .pc = pc,
+        .mem_offset = mem_offset,
+        .rx_reads_per_loop = rx_reads_per_loop,
+        .exec = exec,
+        .pc_hw = pc_hw
+    };
+
+    ssize_t delta = (ssize_t)mem_offset - (ssize_t)pc;
+    log_index = (log_index + 1) % MAX_LOG_COUNT;
+
+    if (delta < 0 && !triggered) {
+        triggered = true;
+
+        flush_logs();  // 触发后打印完整 buffer
+
+        log_printf("err: Loop %u | PC: 0x%zx | Mem: 0x%zx | Delta: %zd | RxReads: %u | Exec: %u | PC_HW: 0x%zx\n",
+                   execution_loops, pc, mem_offset, delta, rx_reads_per_loop, exec, pc_hw);
+    }
+}
+
+void hardware::flush_logs() {
+    // 由于 log_buffer 是循环的，log_index 是下一个将要写入的位置
+    int start = log_index;
+    for (int i = 0; i < MAX_LOG_COUNT; ++i) {
+        int idx = (start + i) % MAX_LOG_COUNT;
+        const LogEntry& e = log_buffer[idx];
+        ssize_t delta = (ssize_t)e.mem_offset - (ssize_t)e.pc;
+        ssize_t deltaO = delta - 0x40000;
+
+        log_printf("Loop %u | PC: 0x%zx | Mem: 0x%zx | Delta: %zd | DeltaO: %zd | RxReads: %u | Exec: %u | PC_HW: 0x%zx\n",
+                   e.loop, e.pc, e.mem_offset, delta, deltaO, e.rx_reads_per_loop, e.exec, e.pc_hw);
+    }
+}
+
+
+
 
 int hardware::run_request(server_action &sa) {
 	// See whether HW needs to be reconfigured
@@ -226,7 +290,7 @@ int hardware::run_request(server_action &sa) {
 		// prepare main FSM control loop
 
 		// max bytes to copy into _mar_mem at a time (would block for this long)
-		const unsigned max_bytes_to_copy = 128;
+		const unsigned max_bytes_to_copy = 128;//128;
 
 		// check execution state for issues periodically
 		const unsigned execution_check_interval = 20;
@@ -270,11 +334,17 @@ int hardware::run_request(server_action &sa) {
 				debug_printf("PC wrapped\n");
 				pc_offset += MARGA_MEM_SIZE;
 			}
+			if (pc_hw > old_pc_hw + MARGA_MEM_SIZE -16) {
+				// PC has jumped backward due to a wrap from waiting/pausing 
+				log_printf("PC Inversely wrapped: Loop %u | Mem: 0x%zx | RxReads: %u | Exec: %u | PC_HW: 0x%zx | OLD_PC_HW: 0x%zx\n",
+                   execution_loops, mem_offset, rx_reads_per_loop, exec, pc_hw, old_pc_hw);
+				pc_offset -= MARGA_MEM_SIZE;
+			}
 			old_pc_hw = pc_hw;
 
 			size_t pc = pc_hw + pc_offset;
 			// unwrap pc
-			debug_printf("pc_hw %zu, old_pc_hw %zu, pc %zu\n", pc_hw, old_pc_hw, pc);
+			//log_printf("pc_hw %zu, old_pc_hw %zu, pc %zu, mem %zu\n", pc_hw, old_pc_hw, pc, mem_offset);
 
 			size_t total_bytes_remaining = total_bytes_to_copy - mem_offset;
 			int bytes_to_copy = 0;
@@ -288,12 +358,13 @@ int hardware::run_request(server_action &sa) {
 			}
 
 			if (bytes_to_copy > 0) {
+				record_log(execution_loops, pc, mem_offset, rx_reads_per_loop, exec, pc_hw);
 				// Monitor memory reserve during streaming
 				if (pc > mem_offset) {
 					// memory reserve has run dry
 					bytes_to_copy = 0;
 					mem_buffer_underrun = true;
-					debug_printf("mem buf underrun\n");
+					log_printf("mem buf underrun\n");
 					break;
 				} else if (mem_offset - pc < MARGA_MEM_SIZE/4) {
 					// memory reserve only 1/4 full
@@ -399,6 +470,7 @@ int hardware::run_request(server_action &sa) {
 			sprintf(t, "RX FIFO/s almost filled during sequence %u times", rx_nearly_full);
 			sa.add_warning(t);
 		}
+		//flush_logs();
 
 		if (buf_err) {
 			sprintf(t, "output buffers overflowed during sequence: 0x%08x", buf_err);
