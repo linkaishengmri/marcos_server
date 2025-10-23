@@ -6,6 +6,7 @@
 #include <chrono>
 #include <vector>
 #include <sys/mman.h>
+#include "led.h"
 
 #ifdef VERILATOR_BUILD
 #include "marga_model.hpp"
@@ -18,9 +19,12 @@ extern marga_model *mm;
 
 hardware::hardware() {
 	init_mem();
+	leds_set(MIO_PIN_10, 1);
 }
 
 hardware::~hardware() {
+	leds_set(MIO_PIN_10, 0);
+	leds_cleanup();
 }
 
 int hardware::run_request(server_action &sa) {
@@ -195,6 +199,7 @@ int hardware::run_request(server_action &sa) {
 	// Run a sequence
 	auto runs = sa.get_command_and_start_reply("run_seq", status);
 	if (status == 1) {
+		leds_set(MIO_PIN_12, 1);
 		++commands_understood;
 		char t[100];
 
@@ -486,6 +491,7 @@ int hardware::run_request(server_action &sa) {
 
 			mpack_finish_map(wr);
 		}
+		leds_set(MIO_PIN_12, 0);
 	}
 
 	// Test client-server network throughput
@@ -610,6 +616,18 @@ void hardware::init_mem() {
 	// types were used for some of these. Perhaps to allow
 	// different access widths?
 	_slcr = (uint32_t *) mmap(NULL, SLCR_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, SLCR_OFFSET);
+
+	// map PS GPIO block
+	void *gpio_map = mmap(NULL, GPIO_MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, GPIO_BASE);
+
+	if (gpio_map == MAP_FAILED) {
+		throw hw_error("Failed to mmap gpio in hardware::init_mem");
+	} else {
+		if (leds_init_from_maps((void*)_slcr, gpio_map) != 0) {
+			throw hw_error("Function leds_init_from_maps failed");
+		}
+	}
+
 	_mar_base = (uint32_t *) mmap(NULL, MARGA_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, MARGA_OFFSET);
 
 	// Map the control and status registers

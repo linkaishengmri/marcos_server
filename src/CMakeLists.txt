@@ -13,5 +13,5 @@ else()
    # set (CMAKE_CXX_FLAGS "-static -O3 -std=c++14")   
 endif()
 
-set(SERVER_SRC marcos_server.cpp hardware.cpp iface.cpp mpack/mpack.c)
+set(SERVER_SRC marcos_server.cpp hardware.cpp iface.cpp mpack/mpack.c led.c)
 add_executable(marcos_server ${SERVER_SRC})
