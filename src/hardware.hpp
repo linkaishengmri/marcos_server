@@ -12,10 +12,10 @@
 // Memory-mapped device sizes
 static const unsigned PAGESIZE = sysconf(_SC_PAGESIZE); // should be 4096 (4KiB) on both x86_64 and ARM
 static const unsigned SLCR_SIZE = PAGESIZE,
-	MARGA_SIZE = 128*PAGESIZE,
-	MARGA_MEM_SIZE = 64*PAGESIZE;
-static const unsigned MARGA_MEM_MASK = 0x3ffff;
-static const unsigned MARGA_RX_FIFO_SPACE = 16384;
+	MARGA_SIZE = 32*PAGESIZE,
+	MARGA_MEM_SIZE = 16*PAGESIZE;
+static const unsigned MARGA_MEM_MASK = 0x0ffff;
+static const unsigned MARGA_RX_FIFO_SPACE = 8192;
 
 // marga internal states
 static const unsigned MAR_STATE_IDLE = 0, MAR_STATE_PREPARE = 1, MAR_STATE_RUN = 2,
