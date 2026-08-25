@@ -25,6 +25,7 @@ extern "C" {
 }
 
 #include "mpack/mpack.h"
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <stdexcept>
@@ -106,6 +107,14 @@ public:
 	ssize_t finish_reply();
 	/// @brief Flush reply buffer to the stream
 	void send_reply();
+	/// @brief Prepare a dedicated chunk writer used to stream RX data out in chunks
+	void start_chunks(size_t chunk_size);
+	/// @brief Write one intermediate RX chunk (final==false) and flush it immediately
+	void send_intermediate_chunk(const std::vector<uint32_t> &rx0_i, const std::vector<uint32_t> &rx0_q,
+	                             const std::vector<uint32_t> &rx1_i, const std::vector<uint32_t> &rx1_q,
+	                             size_t start, size_t count, size_t chunk_index);
+	/// @brief Tear down the chunk writer (safe to call when not active)
+	void end_chunks();
 	void add_error(std::string s);
 	void add_warning(std::string s);
 	void add_info(std::string s);
@@ -117,6 +126,11 @@ private:
 	mpack_writer_t* _wr;
 	unsigned _request_type, _reply_index, _request_version;
 	std::vector<std::string> _errors, _warnings, _infos;
+
+	mpack_writer_t _chunk_wr;
+	char *_chunk_buf = nullptr;
+	size_t _chunk_buf_size = 0;
+	bool _chunk_active = false;
 
 	/// @brief Encode the vectors of strings containing messages
 	/// (errors, warnings and infos) into msgpack

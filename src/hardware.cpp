@@ -5,6 +5,7 @@
 #include <cassert>
 #include <chrono>
 #include <vector>
+#include <algorithm>
 #include <sys/mman.h>
 #include "led.h"
 
@@ -213,9 +214,39 @@ int hardware::run_request(server_action &sa) {
 			wr32(_ctrl, 0x2); // set bit 1 to halt
 		}
 
-		const size_t total_bytes_to_copy = mpack_node_bin_size(runs);
-		const char *rundata = (char *)mpack_node_bin_data(runs);
+		// Support chunked streaming: run_seq may be a map {data, chunk_points, rx_channels}.
+		// Legacy format is a raw bin; chunk_points == 0 keeps the single-shot reply.
+		mpack_node_t rundata_node = runs;
+		size_t chunk_points = 0;
+		bool use_rx0 = true, use_rx1 = false;  // default: rx0 only (backward compatible)
+		if (mpack_node_type(runs) == mpack_type_map) {
+			mpack_node_t data_node = mpack_node_map_cstr_optional(runs, "data");
+			if (!mpack_node_is_missing(data_node) && mpack_node_type(data_node) == mpack_type_bin) {
+				rundata_node = data_node;
+			}
+			mpack_node_t cp_node = mpack_node_map_cstr_optional(runs, "chunk_points");
+			if (!mpack_node_is_missing(cp_node)) chunk_points = mpack_node_uint(cp_node);
+
+			mpack_node_t rc_node = mpack_node_map_cstr_optional(runs, "rx_channels");
+			if (!mpack_node_is_missing(rc_node) && mpack_node_type(rc_node) == mpack_type_array) {
+				use_rx0 = false;
+				use_rx1 = false;
+				size_t rc_n = mpack_node_array_length(rc_node);
+				for (size_t i = 0; i < rc_n; ++i) {
+					unsigned ch = mpack_node_uint(mpack_node_array_at(rc_node, i));
+					if (ch == 0) use_rx0 = true;
+					else if (ch == 1) use_rx1 = true;
+				}
+			}
+		}
+
+		const size_t total_bytes_to_copy = mpack_node_bin_size(rundata_node);
+		const char *rundata = (char *)mpack_node_bin_data(rundata_node);
 		size_t mem_offset = 0;
+
+		if (chunk_points > 0) {
+			sa.start_chunks(chunk_points);
+		}
 
 		// initially fill the marga memory
 		if (total_bytes_to_copy <= MARGA_MEM_SIZE) {
@@ -255,6 +286,22 @@ int hardware::run_request(server_action &sa) {
 		// RX data
 		std::vector<uint32_t> rx0_i, rx0_q, rx1_i, rx1_q;
 		unsigned rx_reads_per_loop = _min_rx_reads_per_loop;
+
+		// chunked streaming state (chunk boundaries are determined by the active RX channels)
+		size_t chunk_index = 0;
+		size_t flushed = 0;
+
+		auto emit_chunks = [&]() {
+			if (chunk_points == 0) return;
+			size_t avail = 0;
+			if (use_rx0 && use_rx1) avail = std::min(rx0_i.size(), rx1_i.size());
+			else if (use_rx0) avail = rx0_i.size();
+			else if (use_rx1) avail = rx1_i.size();
+			while (avail >= flushed + chunk_points) {
+				sa.send_intermediate_chunk(rx0_i, rx0_q, rx1_i, rx1_q, flushed, chunk_points, chunk_index++);
+				flushed += chunk_points;
+			}
+		};
 
 		// start the FSM
 		wr32(_ctrl, 0x1);
@@ -339,6 +386,10 @@ int hardware::run_request(server_action &sa) {
 
 			// Read out RX
 			unsigned rx_locs = read_rx(rx0_i, rx0_q, rx1_i, rx1_q, rx_reads_per_loop);
+
+			// emit any complete RX chunks accumulated so far
+			emit_chunks();
+
 			// Simple dynamic FIFO read-out speed governor
 			if (rx_locs > MARGA_RX_FIFO_SPACE - 2*_max_rx_reads_per_loop) {
 				rx_full = true;
@@ -431,6 +482,7 @@ int hardware::run_request(server_action &sa) {
 		// }
 		while (read_tries < 100) {
 			final_rx_read += read_rx(rx0_i, rx0_q, rx1_i, rx1_q, 100);
+			emit_chunks();
 			++read_tries;
 			// TODO why does the RX
 		}
@@ -461,7 +513,47 @@ int hardware::run_request(server_action &sa) {
 
 		// encode the RX replies
 		unsigned rx0_elem = rx0_i.size(), rx1_elem = rx1_i.size();
-		if (!rx0_elem and !rx1_elem) {
+		if (chunk_points > 0) {
+			// Chunked mode: intermediate chunks were flushed during the loop; emit the
+			// remaining (partial) chunk as the final chunk inside the normal reply so the
+			// client knows when the stream ends.
+			unsigned rx0_rem = (rx0_elem > flushed) ? (rx0_elem - flushed) : 0;
+			unsigned rx1_rem = (rx1_elem > flushed) ? (rx1_elem - flushed) : 0;
+
+			if (!rx0_elem and !rx1_elem) {
+				sprintf(t, "no RX data received");
+				sa.add_warning(t);
+			}
+
+			mpack_start_map(wr, (rx0_rem ? 2 : 0) + (rx1_rem ? 2 : 0) + 2);
+			if (rx0_rem) {
+				mpack_write_cstr(wr, "rx0_i");
+				mpack_start_array(wr, rx0_rem);
+				for (unsigned k = flushed; k < rx0_elem; ++k) mpack_write_int(wr, rx0_i[k]);
+				mpack_finish_array(wr);
+				mpack_write_cstr(wr, "rx0_q");
+				mpack_start_array(wr, rx0_rem);
+				for (unsigned k = flushed; k < rx0_elem; ++k) mpack_write_int(wr, rx0_q[k]);
+				mpack_finish_array(wr);
+			}
+
+			if (rx1_rem) {
+				mpack_write_cstr(wr, "rx1_i");
+				mpack_start_array(wr, rx1_rem);
+				for (unsigned k = flushed; k < rx1_elem; ++k) mpack_write_int(wr, rx1_i[k]);
+				mpack_finish_array(wr);
+				mpack_write_cstr(wr, "rx1_q");
+				mpack_start_array(wr, rx1_rem);
+				for (unsigned k = flushed; k < rx1_elem; ++k) mpack_write_int(wr, rx1_q[k]);
+				mpack_finish_array(wr);
+			}
+
+			mpack_write_cstr(wr, "chunk_index");
+			mpack_write(wr, (uint32_t)chunk_index);
+			mpack_write_cstr(wr, "final");
+			mpack_write(wr, true);
+			mpack_finish_map(wr);
+		} else if (!rx0_elem and !rx1_elem) {
 			mpack_write(wr, c_ok);
 			sprintf(t, "no RX data received");
 			sa.add_warning(t);
