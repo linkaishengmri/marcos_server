@@ -54,6 +54,7 @@ server_action::server_action(mpack_node_t request_root, mpack_writer_t* writer):
 }
 
 server_action::~server_action() {
+	end_chunks();
 	// if (mpack_tree_destroy(&_tree) != mpack_ok) {
 	// 	perror("Error occurred tearing down the reply MPack tree\n");
 	// 	// throw std::runtime_error("Error occurred tearing down an MPack tree"); // SHOULD NOT THROW EXCEPTIONS IN DESTRUCTORS
@@ -114,6 +115,79 @@ ssize_t server_action::finish_reply() {
 
 void server_action::send_reply() {
 	mpack_writer_flush_message(_wr);
+}
+
+void server_action::start_chunks(size_t chunk_size) {
+	if (_chunk_active) return;
+	// Size the buffer generously for one chunk: 4 arrays * up to 8 bytes per entry + overhead.
+	_chunk_buf_size = chunk_size * 4 * 8 + 4096;
+	_chunk_buf = (char *)malloc(_chunk_buf_size);
+	mpack_writer_init(&_chunk_wr, _chunk_buf, _chunk_buf_size);
+	mpack_writer_set_context(&_chunk_wr, mpack_writer_context(_wr));
+	mpack_writer_set_flush(&_chunk_wr, &write_stream);
+	_chunk_active = true;
+}
+
+void server_action::send_intermediate_chunk(const std::vector<uint32_t> &rx0_i, const std::vector<uint32_t> &rx0_q,
+                                           const std::vector<uint32_t> &rx1_i, const std::vector<uint32_t> &rx1_q,
+                                           size_t start, size_t count, size_t chunk_index) {
+	mpack_writer_t *w = &_chunk_wr;
+	bool has_rx0 = (rx0_i.size() >= start + count);
+	bool has_rx1 = (rx1_i.size() >= start + count);
+
+	mpack_start_array(w, 6);
+	mpack_write_u32(w, marcos_reply);
+	mpack_write_u32(w, _reply_index + 1);
+	mpack_write_u32(w, 0);
+	mpack_write_u32(w, SERVER_VERSION_UINT);
+
+	mpack_start_map(w, 1);
+	mpack_write_cstr(w, "run_seq");
+	mpack_start_map(w, (has_rx0 ? 2 : 0) + (has_rx1 ? 2 : 0) + 2);
+
+	if (has_rx0) {
+		mpack_write_cstr(w, "rx0_i");
+		mpack_start_array(w, count);
+		for (size_t k = 0; k < count; ++k) mpack_write_int(w, rx0_i[start + k]);
+		mpack_finish_array(w);
+		mpack_write_cstr(w, "rx0_q");
+		mpack_start_array(w, count);
+		for (size_t k = 0; k < count; ++k) mpack_write_int(w, rx0_q[start + k]);
+		mpack_finish_array(w);
+	}
+
+	if (has_rx1) {
+		mpack_write_cstr(w, "rx1_i");
+		mpack_start_array(w, count);
+		for (size_t k = 0; k < count; ++k) mpack_write_int(w, rx1_i[start + k]);
+		mpack_finish_array(w);
+		mpack_write_cstr(w, "rx1_q");
+		mpack_start_array(w, count);
+		for (size_t k = 0; k < count; ++k) mpack_write_int(w, rx1_q[start + k]);
+		mpack_finish_array(w);
+	}
+
+	mpack_write_cstr(w, "chunk_index");
+	mpack_write(w, (uint32_t)chunk_index);
+	mpack_write_cstr(w, "final");
+	mpack_write(w, false);
+
+	mpack_finish_map(w); // run_seq map
+	mpack_finish_map(w); // command map
+	mpack_start_map(w, 0); // messages
+	mpack_finish_map(w);
+	mpack_finish_array(w);
+
+	mpack_writer_flush_message(w);
+}
+
+void server_action::end_chunks() {
+	if (!_chunk_active) return;
+	mpack_writer_destroy(&_chunk_wr);
+	free(_chunk_buf);
+	_chunk_buf = nullptr;
+	_chunk_buf_size = 0;
+	_chunk_active = false;
 }
 
 bool server_action::reader_err() {
