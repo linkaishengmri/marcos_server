@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cassert>
 #include <chrono>
+#include <deque>
+#include <memory>
 #include <vector>
 #include <algorithm>
 #include <sys/mman.h>
@@ -16,6 +18,40 @@ extern marga_model *mm;
 // variadic macro for debugging enable/disable
 // #define debug_printf(...) printf(__VA_ARGS__)
 #define debug_printf(...)
+
+// Normal (non-streaming) runs must retain all RX data until the final reply,
+// but must not repeatedly relocate a growing monolithic vector in the FIFO
+// read path.  Data is consequently stored in independent fixed-size blocks.
+// A run may use any number of blocks.
+static const size_t RX_BLOCK_POINTS = 16384;
+
+struct rx_block {
+	std::unique_ptr<uint32_t[]> i{new uint32_t[RX_BLOCK_POINTS]};
+	std::unique_ptr<uint32_t[]> q{new uint32_t[RX_BLOCK_POINTS]};
+	size_t used = 0;
+};
+
+class rx_block_store {
+public:
+	void append(uint32_t i_value, uint32_t q_value) {
+		if (_blocks.empty() || _blocks.back()->used == RX_BLOCK_POINTS) {
+			_blocks.push_back(std::make_unique<rx_block>());
+		}
+		rx_block &block = *_blocks.back();
+		block.i[block.used] = i_value;
+		block.q[block.used] = q_value;
+		++block.used;
+		++_size;
+	}
+
+	size_t size() const { return _size; }
+	bool empty() const { return _size == 0; }
+	const std::deque<std::unique_ptr<rx_block>>& blocks() const { return _blocks; }
+
+private:
+	std::deque<std::unique_ptr<rx_block>> _blocks;
+	size_t _size = 0;
+};
 
 hardware::hardware() {
 	init_mem();
@@ -278,13 +314,29 @@ int hardware::run_request(server_action &sa) {
 		// monitor gradient issues
 		bool ocra1_data_lost = false, ocra1_err = false, fhdo_err = false;
 
-		// RX data
+		// Chunked runs retain only the current unsent chunk in vectors because
+		// server_action::send_intermediate_chunk consumes vector ranges.  Normal
+		// runs use segmented storage so no historical RX data is relocated.
 		std::vector<uint32_t> rx0_i, rx0_q, rx1_i, rx1_q;
+		rx_block_store rx0_blocks, rx1_blocks;
+		if (chunk_points > 0) {
+			// One chunk plus a single read_rx() overshoot is all that remains in
+			// memory in streaming mode.  Reserve it before the FPGA starts so the
+			// first chunk cannot grow a vector in the real-time read path.
+			size_t chunk_capacity = chunk_points + _max_rx_reads_per_loop;
+			if (use_rx0) {
+				rx0_i.reserve(chunk_capacity);
+				rx0_q.reserve(chunk_capacity);
+			}
+			if (use_rx1) {
+				rx1_i.reserve(chunk_capacity);
+				rx1_q.reserve(chunk_capacity);
+			}
+		}
 		unsigned rx_reads_per_loop = _min_rx_reads_per_loop;
 
 		// chunked streaming state (chunk boundaries are determined by the active RX channels)
 		size_t chunk_index = 0;
-		size_t flushed = 0;
 
 		auto emit_chunks = [&]() {
 			if (chunk_points == 0) return;
@@ -292,10 +344,59 @@ int hardware::run_request(server_action &sa) {
 			if (use_rx0 && use_rx1) avail = std::min(rx0_i.size(), rx1_i.size());
 			else if (use_rx0) avail = rx0_i.size();
 			else if (use_rx1) avail = rx1_i.size();
-			while (avail >= flushed + chunk_points) {
-				sa.send_intermediate_chunk(rx0_i, rx0_q, rx1_i, rx1_q, flushed, chunk_points, chunk_index++);
-				flushed += chunk_points;
+			while (avail >= chunk_points) {
+				sa.send_intermediate_chunk(rx0_i, rx0_q, rx1_i, rx1_q, 0, chunk_points, chunk_index++);
+				// Keep only the small tail which arrived after the completed chunk.
+				// erase() does not reduce vector capacity, so this does not cause a
+				// later reallocation.  It moves at most one read_rx() overshoot in
+				// normal operation, rather than all historical acquisition data.
+				if (use_rx0) {
+					rx0_i.erase(rx0_i.begin(), rx0_i.begin() + chunk_points);
+					rx0_q.erase(rx0_q.begin(), rx0_q.begin() + chunk_points);
+				}
+				if (use_rx1) {
+					rx1_i.erase(rx1_i.begin(), rx1_i.begin() + chunk_points);
+					rx1_q.erase(rx1_q.begin(), rx1_q.begin() + chunk_points);
+				}
+				avail -= chunk_points;
 			}
+		};
+
+		auto read_rx_to_blocks = [&](const unsigned max_reads) {
+			uint32_t rxlocs = rd32(_rx_locs);
+			int fifo0_locs = rxlocs & 0xffff, fifo1_locs = rxlocs >> 16;
+			unsigned reads = 0;
+
+			while (fifo0_locs > 0 || fifo1_locs > 0) {
+				if (reads >= max_reads) break;
+
+				bool read_fifo0 = false, read_fifo1 = false;
+				if (fifo1_locs > 2 * fifo0_locs) {
+					read_fifo1 = true;
+				} else if (fifo0_locs > 2 * fifo1_locs) {
+					read_fifo0 = true;
+				} else {
+					read_fifo0 = true;
+					read_fifo1 = true;
+				}
+
+				if (read_fifo0) {
+					uint32_t q = rd32(_rx0_q_data);
+					uint32_t i = rd32(_rx0_i_data); // pop FIFO
+					rx0_blocks.append(i, q);
+					++reads;
+					--fifo0_locs;
+				}
+				if (read_fifo1) {
+					uint32_t q = rd32(_rx1_q_data);
+					uint32_t i = rd32(_rx1_i_data); // pop FIFO
+					rx1_blocks.append(i, q);
+					++reads;
+					--fifo1_locs;
+				}
+			}
+
+			return std::max(fifo0_locs, fifo1_locs);
 		};
 
 		// start the FSM
@@ -379,8 +480,11 @@ int hardware::run_request(server_action &sa) {
 				}
 			}
 
-			// Read out RX
-			unsigned rx_locs = read_rx(rx0_i, rx0_q, rx1_i, rx1_q, rx_reads_per_loop);
+			// Read out RX.  The normal path stores samples in fixed blocks; the
+			// chunk path keeps only its current pending chunk in vectors.
+			unsigned rx_locs = chunk_points > 0
+				? read_rx(rx0_i, rx0_q, rx1_i, rx1_q, rx_reads_per_loop)
+				: read_rx_to_blocks(rx_reads_per_loop);
 
 			// emit any complete RX chunks accumulated so far
 			emit_chunks();
@@ -476,7 +580,9 @@ int hardware::run_request(server_action &sa) {
 		// 	final_rx_read += read_rx(rx0_i, rx0_q, rx1_i, rx1_q);
 		// }
 		while (read_tries < 100) {
-			final_rx_read += read_rx(rx0_i, rx0_q, rx1_i, rx1_q, 100);
+			final_rx_read += chunk_points > 0
+				? read_rx(rx0_i, rx0_q, rx1_i, rx1_q, 100)
+				: read_rx_to_blocks(100);
 			emit_chunks();
 			++read_tries;
 			// TODO why does the RX
@@ -507,13 +613,16 @@ int hardware::run_request(server_action &sa) {
 		// halt();
 
 		// encode the RX replies
-		unsigned rx0_elem = rx0_i.size(), rx1_elem = rx1_i.size();
+		size_t rx0_elem = chunk_points > 0 ? rx0_i.size() : rx0_blocks.size();
+		size_t rx1_elem = chunk_points > 0 ? rx1_i.size() : rx1_blocks.size();
 		if (chunk_points > 0) {
 			// Chunked mode: intermediate chunks were flushed during the loop; emit the
 			// remaining (partial) chunk as the final chunk inside the normal reply so the
 			// client knows when the stream ends.
-			unsigned rx0_rem = (rx0_elem > flushed) ? (rx0_elem - flushed) : 0;
-			unsigned rx1_rem = (rx1_elem > flushed) ? (rx1_elem - flushed) : 0;
+			// Completed chunks were removed from the pending vectors as soon as
+			// they were sent, so every remaining point belongs in the final reply.
+			size_t rx0_rem = rx0_elem;
+			size_t rx1_rem = rx1_elem;
 
 			if (!rx0_elem and !rx1_elem) {
 				sprintf(t, "no RX data received");
@@ -524,22 +633,22 @@ int hardware::run_request(server_action &sa) {
 			if (rx0_rem) {
 				mpack_write_cstr(wr, "rx0_i");
 				mpack_start_array(wr, rx0_rem);
-				for (unsigned k = flushed; k < rx0_elem; ++k) mpack_write_int(wr, rx0_i[k]);
+				for (size_t k = 0; k < rx0_elem; ++k) mpack_write_int(wr, rx0_i[k]);
 				mpack_finish_array(wr);
 				mpack_write_cstr(wr, "rx0_q");
 				mpack_start_array(wr, rx0_rem);
-				for (unsigned k = flushed; k < rx0_elem; ++k) mpack_write_int(wr, rx0_q[k]);
+				for (size_t k = 0; k < rx0_elem; ++k) mpack_write_int(wr, rx0_q[k]);
 				mpack_finish_array(wr);
 			}
 
 			if (rx1_rem) {
 				mpack_write_cstr(wr, "rx1_i");
 				mpack_start_array(wr, rx1_rem);
-				for (unsigned k = flushed; k < rx1_elem; ++k) mpack_write_int(wr, rx1_i[k]);
+				for (size_t k = 0; k < rx1_elem; ++k) mpack_write_int(wr, rx1_i[k]);
 				mpack_finish_array(wr);
 				mpack_write_cstr(wr, "rx1_q");
 				mpack_start_array(wr, rx1_rem);
-				for (unsigned k = flushed; k < rx1_elem; ++k) mpack_write_int(wr, rx1_q[k]);
+				for (size_t k = 0; k < rx1_elem; ++k) mpack_write_int(wr, rx1_q[k]);
 				mpack_finish_array(wr);
 			}
 
@@ -557,22 +666,34 @@ int hardware::run_request(server_action &sa) {
 			if (rx0_elem) {
 				mpack_write_cstr(wr, "rx0_i");
 				mpack_start_array(wr, rx0_elem);
-				for (unsigned k = 0; k < rx0_elem; ++k) mpack_write_int(wr, rx0_i[k]);
+				for (const auto &block_ptr : rx0_blocks.blocks()) {
+					const rx_block &block = *block_ptr;
+					for (size_t k = 0; k < block.used; ++k) mpack_write_int(wr, block.i[k]);
+				}
 				mpack_finish_array(wr);
 				mpack_write_cstr(wr, "rx0_q");
 				mpack_start_array(wr, rx0_elem);
-				for (unsigned k = 0; k < rx0_elem; ++k) mpack_write_int(wr, rx0_q[k]);
+				for (const auto &block_ptr : rx0_blocks.blocks()) {
+					const rx_block &block = *block_ptr;
+					for (size_t k = 0; k < block.used; ++k) mpack_write_int(wr, block.q[k]);
+				}
 				mpack_finish_array(wr);
 			}
 
 			if (rx1_elem) {
 				mpack_write_cstr(wr, "rx1_i");
 				mpack_start_array(wr, rx1_elem);
-				for (unsigned k = 0; k < rx1_elem; ++k) mpack_write_int(wr, rx1_i[k]);
+				for (const auto &block_ptr : rx1_blocks.blocks()) {
+					const rx_block &block = *block_ptr;
+					for (size_t k = 0; k < block.used; ++k) mpack_write_int(wr, block.i[k]);
+				}
 				mpack_finish_array(wr);
 				mpack_write_cstr(wr, "rx1_q");
 				mpack_start_array(wr, rx1_elem);
-				for (unsigned k = 0; k < rx1_elem; ++k) mpack_write_int(wr, rx1_q[k]);
+				for (const auto &block_ptr : rx1_blocks.blocks()) {
+					const rx_block &block = *block_ptr;
+					for (size_t k = 0; k < block.used; ++k) mpack_write_int(wr, block.q[k]);
+				}
 				mpack_finish_array(wr);
 			}
 
