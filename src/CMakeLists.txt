@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.5.1)
 project(marcos_server)
 
+find_package(Threads REQUIRED)
+
 if (${CMAKE_SYSTEM_PROCESSOR} STREQUAL armv7l)
    # compile in release mode on the ARM
    set (CMAKE_C_FLAGS "-static -O3 -mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=neon -mfloat-abi=hard -Wall -std=c11")
@@ -15,3 +17,4 @@ endif()
 
 set(SERVER_SRC marcos_server.cpp hardware.cpp iface.cpp mpack/mpack.c)
 add_executable(marcos_server ${SERVER_SRC})
+target_link_libraries(marcos_server PRIVATE Threads::Threads)
