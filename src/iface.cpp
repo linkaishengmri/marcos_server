@@ -54,9 +54,7 @@ server_action::server_action(mpack_node_t request_root, mpack_writer_t* writer):
 	// Start constructing the reply
 	mpack_start_array(_wr, 6);
 
-	if (_request_type == marcos_emergency_stop) mpack_write_u32(_wr, marcos_reply_error);
-//	else if (_request_type == marcos_close_server) mpack_write_u32(_wr,
-	else mpack_write_u32(_wr, marcos_reply);
+	mpack_write_u32(_wr, marcos_reply);
 
 	mpack_write_u32(_wr, _reply_index + 1); // reply index for the client to keep track
 	mpack_write_u32(_wr, 0); // unused for now
@@ -91,23 +89,56 @@ mpack_node_t server_action::get_command_and_start_reply(const char* cstr, int &s
 
 int server_action::process_request() {
 	if (_request_type != marcos_request) {
-		mpack_start_map(_wr, 0); // dummy map, has no content since no results will be returned
-		mpack_finish_map(_wr);
-
 		if (_request_type == marcos_emergency_stop) {
-			// emergency stop should be processed immediately before anything else!
-			emergency_stop();
-			add_error("Emergency stop not yet implemented!");
-			add_warning("Tried to carry out emergency stop!");
+			// Emergency stop deliberately bypasses the ordinary request mutex and
+			// may therefore interrupt a run_seq being handled on another socket.
+			std::string gradient_board_name;
+			std::string acquisition_id;
+			if (mpack_node_type(_rd) == mpack_type_map) {
+				mpack_node_t grad_node = mpack_node_map_cstr_optional(_rd, "grad_board");
+				if (!mpack_node_is_missing(grad_node) && mpack_node_type(grad_node) == mpack_type_str) {
+					gradient_board_name.assign(mpack_node_str(grad_node), mpack_node_strlen(grad_node));
+				}
+				mpack_node_t id_node = mpack_node_map_cstr_optional(_rd, "acquisition_id");
+				if (!mpack_node_is_missing(id_node) && mpack_node_type(id_node) == mpack_type_str) {
+					acquisition_id.assign(mpack_node_str(id_node), mpack_node_strlen(id_node));
+				}
+			}
+			emergency_stop_result result = hw->emergency_stop(gradient_board_name, acquisition_id);
+			mpack_start_map(_wr, 1);
+			mpack_write_cstr(_wr, "emergency_stop");
+			mpack_start_map(_wr, 6);
+			mpack_write_cstr(_wr, "ok");
+			mpack_write(_wr, result.ok());
+			mpack_write_cstr(_wr, "latched");
+			mpack_write(_wr, true);
+			mpack_write_cstr(_wr, "fsm_idle");
+			mpack_write(_wr, result.fsm_idle);
+			mpack_write_cstr(_wr, "digital_outputs_zeroed");
+			mpack_write(_wr, result.digital_outputs_zeroed);
+			mpack_write_cstr(_wr, "gradients_zeroed");
+			mpack_write(_wr, result.gradients_zeroed);
+			mpack_write_cstr(_wr, "rx_fifo_empty");
+			mpack_write(_wr, result.rx_fifo_empty);
+			mpack_finish_map(_wr);
+			mpack_finish_map(_wr);
+			if (result.ok()) add_info("Emergency stop latched; hardware is in the safe state.");
+			else add_error("Emergency stop latched, but one or more hardware safety checks failed.");
 			return 0;
 		} else if (_request_type == marcos_close_server) {
+			mpack_start_map(_wr, 0);
+			mpack_finish_map(_wr);
 			add_info("Shutting down server.");
 			return -1; // message to iface to shut down server (maybe more in the future)
 		}
+
+		mpack_start_map(_wr, 0);
+		mpack_finish_map(_wr);
+		add_error("Unknown request packet type.");
+		return 0;
 	}
 	// default: run the request on the hardware, feeding in this server_action object
 	try {
-		// int problems = hw->run_request(*this);
 		hw->run_request(*this);
 	} catch (std::runtime_error &e) {
 		add_error(e.what());
@@ -191,6 +222,30 @@ void server_action::send_intermediate_chunk(const std::vector<uint32_t> &rx0_i, 
 	mpack_writer_flush_message(w);
 }
 
+void server_action::send_intermediate_armed() {
+	if (!_chunk_active) start_chunks(0);
+	mpack_writer_t *w = &_chunk_wr;
+
+	mpack_start_array(w, 6);
+	mpack_write_u32(w, marcos_reply);
+	mpack_write_u32(w, _reply_index + 1);
+	mpack_write_u32(w, 0);
+	mpack_write_u32(w, SERVER_VERSION_UINT);
+	mpack_start_map(w, 1);
+	mpack_write_cstr(w, "run_seq");
+	mpack_start_map(w, 2);
+	mpack_write_cstr(w, "armed");
+	mpack_write(w, true);
+	mpack_write_cstr(w, "final");
+	mpack_write(w, false);
+	mpack_finish_map(w);
+	mpack_finish_map(w);
+	mpack_start_map(w, 0);
+	mpack_finish_map(w);
+	mpack_finish_array(w);
+	mpack_writer_flush_message(w);
+}
+
 void server_action::end_chunks() {
 	if (!_chunk_active) return;
 	mpack_writer_destroy(&_chunk_wr);
@@ -257,12 +312,6 @@ void server_action::check_version() {
 		e << "Client version " << version_str(_request_version) << " differs slightly from server version " << SERVER_VERSION_STR;
 		add_info(e.str());
 	}
-}
-
-void server_action::emergency_stop() {
-	// perror("Emergency stop not yet implemented - do this soon!");
-	fprintf(stderr, "Emergency stop not yet implemented - do this soon!\n");
-	// exit(EXIT_FAILURE);
 }
 
 iface::iface(unsigned port) {
@@ -381,7 +430,7 @@ void iface::handle_connection(int connection_fd) {
 
 	if (shutdown_requested) {
 		_run_iface.store(false);
-		hw->halt_and_reset();
+		hw->emergency_stop();
 		shutdown(_server_fd, SHUT_RDWR);
 		stop_other_connections(connection_fd);
 	}
