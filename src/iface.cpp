@@ -5,6 +5,9 @@
 #include <sstream>
 #include <iostream>
 #include <cassert>
+#include <cerrno>
+#include <cstdio>
+#include <exception>
 
 extern hardware *hw;
 
@@ -23,9 +26,16 @@ size_t read_stream(mpack_tree_t* tree, char* buffer, size_t count) {
 
 void write_stream(mpack_writer_t* writer, const char* buffer, size_t count) {
 	stream_t* stream = (stream_t *)mpack_writer_context(writer);
-	ssize_t amount = write(stream->fd, buffer, count);
-	if (amount <= 0) mpack_writer_flag_error(writer, mpack_error_io);
-//	return amount;
+	size_t written = 0;
+	while (written < count) {
+		ssize_t amount = write(stream->fd, buffer + written, count - written);
+		if (amount < 0 && errno == EINTR) continue;
+		if (amount <= 0) {
+			mpack_writer_flag_error(writer, mpack_error_io);
+			return;
+		}
+		written += (size_t)amount;
+	}
 }
 
 server_action::server_action(mpack_node_t request_root, mpack_writer_t* writer):
@@ -289,77 +299,119 @@ void iface::init(unsigned port) {
 }
 
 void iface::run_stream() {
-	const unsigned max_size = 1024*1024*320;
-	const unsigned max_nodes = 8192;
-
-	char *reply_buf = (char *)malloc(max_size);
-
-	while (_run_iface) {
-		// block until a client connects
-		if((_stream_fd.fd = accept(_server_fd, NULL, NULL)) < 0) {
-			// if((my_socket = accept(stream_fd.fd, (struct sockaddr *)&address, (socklen_t *)&addrlen)) < 0) {
+	while (_run_iface.load()) {
+		int connection_fd = accept(_server_fd, NULL, NULL);
+		if (connection_fd < 0) {
+			if (!_run_iface.load()) break;
+			if (errno == EINTR) continue;
 			fprintf(stderr, "[%s line %d] socket accept failed\n", __FILE__, __LINE__);
-			exit(EXIT_FAILURE);
+			continue;
 		}
-
-		// mpack reader mechanism
-		mpack_tree_t tree;
-		mpack_tree_init_stream(&tree, &read_stream, &_stream_fd, max_size, max_nodes);
-
-		// mpack writer mechanism
-		// CONTINUE HERE; use mpack_writer_init(), mpack_writer_set_context(), mpack_writer_set_flush() and maybe mpack_writer_set_error_handler(); then when ready to send stuff, mpack_writer_flush_message(). First though, test basic string replies.
-		mpack_writer_t writer;
-		mpack_writer_init(&writer, reply_buf, max_size);
-		mpack_writer_set_context(&writer, &_stream_fd);
-		mpack_writer_set_flush(&writer, &write_stream);
-
-		while (true) {
-			mpack_tree_parse(&tree); // blocking
-			//mpack_tree_try_parse(&tree); // non-blocking, for future use
-			mpack_error_t err = mpack_tree_error(&tree);
-			if ( err != mpack_ok) {
-				if (err != mpack_error_io) {
-					// mpack_error_io thrown whenever the client disconnects.
-					// Haven't found a way around this so just ignoring it for now.
-					// Below will catch other kinds of error though.
-					fprintf(stderr, "Parsing the MPack tree failed: %s\n", mpack_error_to_string(err));
-				}
-				break;
-			}
-
-			// Reply: use a constant buffer
-			try {
-				server_action sa(mpack_tree_root(&tree), &writer);
-				int sa_status = sa.process_request(); // run hardware operations or whatever else is needed
-				if (sa_status != 0) _run_iface = false; // shut down server gracefully
-				sa.finish_reply();
-				sa.send_reply();
-			} catch (mpack_error &) {
-				fprintf(stderr, "MPack error!\n");
-				// TODO: implement an error callback
-				// for the relevant MPack functions,
-				// and return a packet stating that
-				// there was an MPack error
-			}
+		{
+			std::lock_guard<std::mutex> guard(_connections_mutex);
+			_connection_fds.insert(connection_fd);
 		}
-
-		mpack_error_t err = mpack_tree_destroy(&tree);
-		if (err != mpack_ok and err != mpack_error_io) {
-			// As for the streaming, mpack_error_io always happens at the moment
-			fprintf(stderr, "Tearing down the MPack tree failed: %s\n", mpack_error_to_string(err));
-		}
-
-		mpack_error_t err2 = mpack_writer_destroy(&writer);
-		if (err2 != mpack_ok) fprintf(stderr, "Destroying the MPack writer failed: %s\n", mpack_error_to_string(err2));
-
-		if (close(_stream_fd.fd) < 0) {
-			fprintf(stderr, "[%s line %d] closing socket failed\n", __FILE__, __LINE__);
-			exit(EXIT_FAILURE);
+		try {
+			// This must remain asynchronous: a run_seq connection can block while
+			// an independently accepted emergency-stop connection is handled.
+			// Do not use detach() here; it is broken by the target's static C++
+			// thread runtime even though thread construction succeeds.
+			_connection_threads.emplace_back(&iface::handle_connection, this,
+			                                 connection_fd);
+		} catch (const std::system_error &) {
+			connection_finished(connection_fd);
+			close(connection_fd);
 		}
 	}
 
+	stop_other_connections(-1);
+	for (std::thread &connection_thread : _connection_threads) {
+		if (connection_thread.joinable()) connection_thread.join();
+	}
+	_connection_threads.clear();
+}
+
+void iface::handle_connection(int connection_fd) {
+	const unsigned max_request_size = 1024*1024*320;
+	const unsigned max_nodes = 8192;
+	stream_t stream{connection_fd};
+	char *reply_buf = (char *)malloc(64*1024);
+	if (!reply_buf) {
+		connection_finished(connection_fd);
+		close(connection_fd);
+		return;
+	}
+
+	mpack_tree_t tree;
+	mpack_tree_init_stream(&tree, &read_stream, &stream, max_request_size, max_nodes);
+	mpack_writer_t writer;
+	mpack_writer_init(&writer, reply_buf, 64*1024);
+	mpack_writer_set_context(&writer, &stream);
+	mpack_writer_set_flush(&writer, &write_stream);
+
+	bool shutdown_requested = false;
+	while (_run_iface.load()) {
+		mpack_tree_parse(&tree);
+		mpack_error_t err = mpack_tree_error(&tree);
+		if (err != mpack_ok) {
+			if (err != mpack_error_io) {
+				fprintf(stderr, "Parsing the MPack tree failed: %s\n", mpack_error_to_string(err));
+			}
+			break;
+		}
+
+		try {
+			server_action sa(mpack_tree_root(&tree), &writer);
+			int sa_status = sa.process_request();
+			sa.finish_reply();
+			sa.send_reply();
+			if (sa_status != 0) {
+				shutdown_requested = true;
+				break;
+			}
+		} catch (mpack_error &) {
+			fprintf(stderr, "MPack error!\n");
+			break;
+		} catch (const std::exception &) {
+			break;
+		} catch (...) {
+			break;
+		}
+	}
+
+	if (shutdown_requested) {
+		_run_iface.store(false);
+		hw->halt_and_reset();
+		shutdown(_server_fd, SHUT_RDWR);
+		stop_other_connections(connection_fd);
+	}
+
+	mpack_error_t err = mpack_tree_destroy(&tree);
+	if (err != mpack_ok && err != mpack_error_io) {
+		fprintf(stderr, "Tearing down the MPack tree failed: %s\n", mpack_error_to_string(err));
+	}
+	mpack_error_t writer_err = mpack_writer_destroy(&writer);
+	if (writer_err != mpack_ok && writer_err != mpack_error_io) {
+		fprintf(stderr, "Destroying the MPack writer failed: %s\n", mpack_error_to_string(writer_err));
+	}
+
+	connection_finished(connection_fd);
+	close(connection_fd);
 	free(reply_buf);
 }
 
+void iface::connection_finished(int connection_fd) {
+	std::lock_guard<std::mutex> guard(_connections_mutex);
+	_connection_fds.erase(connection_fd);
+}
+
+void iface::stop_other_connections(int except_fd) {
+	std::lock_guard<std::mutex> guard(_connections_mutex);
+	for (int fd : _connection_fds) {
+		if (fd != except_fd) shutdown(fd, SHUT_RDWR);
+	}
+}
+
 iface::~iface() {
+	if (_server_fd >= 0) close(_server_fd);
 }

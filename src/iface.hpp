@@ -25,8 +25,12 @@ extern "C" {
 }
 
 #include "mpack/mpack.h"
+#include <atomic>
 #include <cstdint>
+#include <mutex>
+#include <set>
 #include <string>
+#include <thread>
 #include <vector>
 #include <stdexcept>
 
@@ -161,13 +165,23 @@ public:
 	int process_message(mpack_node_t root, char *reply_buf);
 	~iface();
 private:
-	bool _run_iface = true;
+	std::atomic<bool> _run_iface{true};
 
 	struct sockaddr_in _address;
 	size_t _addrlen;
 
 	int _server_fd;
-	stream_t _stream_fd;
+	std::mutex _connections_mutex;
+	std::set<int> _connection_fds;
+	// Do not detach connection workers.  The statically linked libstdc++ on
+	// the deployed Red Pitaya can create a std::thread but throws from
+	// std::thread::detach().  Keeping the handles also lets run_stream() join
+	// every worker after the listening socket has been shut down.
+	std::vector<std::thread> _connection_threads;
+
+	void handle_connection(int connection_fd);
+	void connection_finished(int connection_fd);
+	void stop_other_connections(int except_fd);
 };
 
 #endif
