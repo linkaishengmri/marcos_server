@@ -117,6 +117,8 @@ public:
 	void send_intermediate_chunk(const std::vector<uint32_t> &rx0_i, const std::vector<uint32_t> &rx0_q,
 	                             const std::vector<uint32_t> &rx1_i, const std::vector<uint32_t> &rx1_q,
 	                             size_t start, size_t count, size_t chunk_index);
+	/// @brief Report that a run has reached the FPGA TRIG_FOREVER state.
+	void send_intermediate_armed();
 	/// @brief Tear down the chunk writer (safe to call when not active)
 	void end_chunks();
 	void add_error(std::string s);
@@ -146,8 +148,6 @@ private:
 	/// If the debug version differs, send back info.
 	void check_version();
 
-	/// @brief Carry out emergency stop: zero the RF and DACs, halt sequence, etc...
-	void emergency_stop();
 };
 
 ///@brief Interface manager class, encapsulating the interface logic

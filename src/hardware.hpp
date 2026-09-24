@@ -7,6 +7,11 @@
 
 #include <inttypes.h> // TODO is this the right include?
 #include <unistd.h>
+#include <atomic>
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <unordered_set>
 #include <vector>
 
 // Memory-mapped device sizes
@@ -31,6 +36,17 @@ struct mpack_node_t;
 
 class server_action;
 
+struct emergency_stop_result {
+	bool fsm_idle = false;
+	bool digital_outputs_zeroed = false;
+	bool gradients_zeroed = false;
+	bool rx_fifo_empty = false;
+
+	bool ok() const {
+		return fsm_idle && digital_outputs_zeroed && gradients_zeroed && rx_fifo_empty;
+	}
+};
+
 class hardware {
 public:
 	hardware();
@@ -50,7 +66,20 @@ public:
 	/// if the cores are currently running. Activated when an
 	/// emergency stop command arrives.
 	void halt_and_reset();
+
+	/// @brief Latch an emergency stop, interrupt the active run from a
+	/// separate connection, and leave all outputs in their safe state.
+	emergency_stop_result emergency_stop(
+		const std::string &gradient_board_name = std::string(),
+		const std::string &acquisition_id = std::string());
 private:
+	enum class gradient_board {
+		unknown,
+		ocra1,
+		ocra1_5761,
+		gpa_fhdo
+	};
+
 	// Config variables
 	unsigned _pc_tries_limit = 1000000; // how long to wait if PC isn't changing
 	unsigned _idle_tries_limit = 1000000; // how long to wait for the end of the sequence if memory is fully written
@@ -67,6 +96,31 @@ private:
 		*_rx0_i_data, *_rx1_i_data, *_rx0_q_data, *_rx1_q_data;
 
 	volatile char *_mar_mem;
+
+	// Ordinary requests are serialized, while emergency_stop() deliberately
+	// bypasses this mutex so it can interrupt a blocking run_seq request.
+	std::mutex _request_mutex;
+	std::mutex _io_mutex;
+	std::atomic<bool> _emergency_latched{false};
+	std::atomic<uint64_t> _abort_epoch{0};
+	std::atomic<gradient_board> _gradient_board{gradient_board::unknown};
+	std::unordered_set<std::string> _aborted_acquisition_ids;
+
+	bool prepare_run(bool rearm, const std::string &acquisition_id, uint64_t &run_epoch);
+	bool run_aborted(uint64_t run_epoch) const;
+	bool start_run(uint64_t run_epoch);
+	bool finish_run(uint64_t run_epoch);
+	void force_safe_state(bool keep_stop_latched, emergency_stop_result &result);
+	bool wait_for_fsm_idle();
+	bool wait_for_buffers_empty();
+	bool wait_for_gradient_idle(uint32_t status_mask);
+	bool zero_gradients();
+	bool drain_rx_fifos();
+	void zero_digital_outputs();
+	void direct_write(unsigned buffer, uint16_t value);
+	void set_gradient_board(const std::string &name);
+	bool acquisition_was_aborted(const std::string &acquisition_id) const;
+	void remember_aborted_acquisition(const std::string &acquisition_id);
 
 	/// @brief Write
 

@@ -61,6 +61,11 @@ hardware::~hardware() {
 }
 
 int hardware::run_request(server_action &sa) {
+	// A server may service several TCP connections, but only one ordinary
+	// hardware request may own the FPGA at a time. emergency_stop() bypasses
+	// this lock and interrupts run_seq through the abort epoch below.
+	std::lock_guard<std::mutex> request_guard(_request_mutex);
+
 	// See whether HW needs to be reconfigured
 	size_t commands_present = sa.command_count();
 	size_t commands_understood = 0;
@@ -100,11 +105,20 @@ int hardware::run_request(server_action &sa) {
 		if (mpack_node_array_length(fcwa1) != 3) {
 			sa.add_error("you only provided some FPGA clock control words; check you're providing all 3");
 			mpack_write(wr, c_err); // error
+		} else if (_emergency_latched.load(std::memory_order_acquire)) {
+			sa.add_error("fpga_clk rejected while emergency stop is latched");
+			mpack_write(wr, c_err);
 		} else {
+			std::lock_guard<std::mutex> io_guard(_io_mutex);
+			if (_emergency_latched.load(std::memory_order_acquire)) {
+				sa.add_error("fpga_clk rejected while emergency stop is latched");
+				mpack_write(wr, c_err);
+			} else {
 			_slcr[2] = mpack_node_u32(mpack_node_array_at(fcwa1, 0));
 			_slcr[92] = (_slcr[92] & ~mpack_node_u32(mpack_node_array_at(fcwa1, 1)) )
 				| mpack_node_u32(mpack_node_array_at(fcwa1, 2));
 			mpack_write(wr, c_ok); // okay
+			}
 		}
 	} else if (status == -1) {
 		// sa.add_error("Unknown MPack error from fpga_clk");
@@ -115,18 +129,30 @@ int hardware::run_request(server_action &sa) {
 	auto ctrl = sa.get_command_and_start_reply("ctrl", status);
 	if (status == 1) {
 		++commands_understood;
-		wr32(_ctrl, mpack_node_u32(ctrl));
-		mpack_write(wr, c_ok);
+		std::lock_guard<std::mutex> io_guard(_io_mutex);
+		if (_emergency_latched.load(std::memory_order_acquire)) {
+			sa.add_error("ctrl rejected while emergency stop is latched");
+			mpack_write(wr, c_err);
+		} else {
+			wr32(_ctrl, mpack_node_u32(ctrl));
+			mpack_write(wr, c_ok);
+		}
 	}
 
 	// Command directly to the buffers
 	auto dir = sa.get_command_and_start_reply("direct", status);
 	if (status == 1) {
 		++commands_understood;
-		wr32(_direct, mpack_node_u32(dir));
-		// TODO: add sanity check for instruction/data type
-		// TODO: implement higher-level direct commands, like 32b writes etc
-		mpack_write(wr, c_ok);
+		std::lock_guard<std::mutex> io_guard(_io_mutex);
+		if (_emergency_latched.load(std::memory_order_acquire)) {
+			sa.add_error("direct rejected while emergency stop is latched");
+			mpack_write(wr, c_err);
+		} else {
+			wr32(_direct, mpack_node_u32(dir));
+			// TODO: add sanity check for instruction/data type
+			// TODO: implement higher-level direct commands, like 32b writes etc
+			mpack_write(wr, c_ok);
+		}
 	}
 
 	// Read one register
@@ -235,22 +261,19 @@ int hardware::run_request(server_action &sa) {
 		++commands_understood;
 		char t[100];
 
-		// ensure that nothing is currently running; halt if it is
-		auto exec = rd32(_exec);
-		if ( (exec >> 24) != MAR_STATE_IDLE) {
-			sprintf(t, "mar FSM was not idle when the run began");
-			sa.add_warning(t);
-
-			// halt FSM
-			wr32(_ctrl, 0x2); // set bit 1 to halt
-		}
-
-		// Support chunked streaming: run_seq may be a map {data, chunk_points, rx_channels}.
+		// Support structured run control as well as the legacy raw binary value.
 		// Legacy format is a raw bin; chunk_points == 0 keeps the single-shot reply.
 		mpack_node_t rundata_node = runs;
 		size_t chunk_points = 0;
 		bool use_rx0 = true, use_rx1 = false;  // default: rx0 only (backward compatible)
-		if (mpack_node_type(runs) == mpack_type_map) {
+		bool report_armed = false;
+		// Only the structured protocol can explicitly rearm a latched server.
+		// Legacy requests still run normally while no emergency stop is latched.
+		bool rearm = false;
+		std::string acquisition_id;
+		std::string gradient_board_name;
+		const bool structured_run = mpack_node_type(runs) == mpack_type_map;
+		if (structured_run) {
 			mpack_node_t data_node = mpack_node_map_cstr_optional(runs, "data");
 			if (!mpack_node_is_missing(data_node) && mpack_node_type(data_node) == mpack_type_bin) {
 				rundata_node = data_node;
@@ -269,13 +292,55 @@ int hardware::run_request(server_action &sa) {
 					else if (ch == 1) use_rx1 = true;
 				}
 			}
+
+			mpack_node_t armed_node = mpack_node_map_cstr_optional(runs, "report_armed");
+			if (!mpack_node_is_missing(armed_node)) report_armed = mpack_node_bool(armed_node);
+
+			mpack_node_t rearm_node = mpack_node_map_cstr_optional(runs, "rearm");
+			if (!mpack_node_is_missing(rearm_node)) rearm = mpack_node_bool(rearm_node);
+
+			mpack_node_t grad_node = mpack_node_map_cstr_optional(runs, "grad_board");
+			if (!mpack_node_is_missing(grad_node) && mpack_node_type(grad_node) == mpack_type_str) {
+				gradient_board_name.assign(mpack_node_str(grad_node), mpack_node_strlen(grad_node));
+			}
+
+			mpack_node_t id_node = mpack_node_map_cstr_optional(runs, "acquisition_id");
+			if (!mpack_node_is_missing(id_node) && mpack_node_type(id_node) == mpack_type_str) {
+				acquisition_id.assign(mpack_node_str(id_node), mpack_node_strlen(id_node));
+			}
 		}
+		uint64_t run_epoch = 0;
+		if (!prepare_run(rearm, acquisition_id, run_epoch)) {
+			mpack_start_map(wr, 2);
+			mpack_write_cstr(wr, "final");
+			mpack_write(wr, true);
+			mpack_write_cstr(wr, "aborted");
+			mpack_write(wr, true);
+			mpack_finish_map(wr);
+			sa.add_warning("run_seq rejected: emergency stop is latched or acquisition_id was already aborted");
+		} else {
+			if (!gradient_board_name.empty()) set_gradient_board(gradient_board_name);
+			// A stale non-idle state is made safe before loading the new scan.
+			auto exec = rd32(_exec);
+			if ( (exec >> 24) != MAR_STATE_IDLE) {
+				sprintf(t, "mar FSM was not idle when the run began");
+				sa.add_warning(t);
+				emergency_stop_result reset_result;
+				{
+					std::lock_guard<std::mutex> io_guard(_io_mutex);
+					// A Stop may have won after prepare_run(). Never let stale-state
+					// cleanup release its hardware latch with ctrl=idle.
+					if (!run_aborted(run_epoch)) {
+						force_safe_state(false, reset_result);
+					}
+				}
+			}
 
 		const size_t total_bytes_to_copy = mpack_node_bin_size(rundata_node);
 		const char *rundata = (char *)mpack_node_bin_data(rundata_node);
 		size_t mem_offset = 0;
 
-		if (chunk_points > 0) {
+		if (chunk_points > 0 || report_armed) {
 			sa.start_chunks(chunk_points);
 		}
 
@@ -289,7 +354,6 @@ int hardware::run_request(server_action &sa) {
 			hw_memcpy(_mar_mem, rundata, MARGA_MEM_SIZE);
 			mem_offset += MARGA_MEM_SIZE;
 		}
-
 		// prepare main FSM control loop
 
 		// max bytes to copy into _mar_mem at a time (would block for this long)
@@ -302,6 +366,8 @@ int hardware::run_request(server_action &sa) {
 		unsigned mem_buffer_low = 0;
 		bool mem_buffer_underrun = false;
 		bool finished = false;
+		bool aborted = false;
+		bool armed_reported = false;
 
 		// monitor RX-nearly-full and RX-full events
 		unsigned rx_nearly_full = 0;
@@ -399,17 +465,27 @@ int hardware::run_request(server_action &sa) {
 			return std::max(fifo0_locs, fifo1_locs);
 		};
 
-		// start the FSM
-		wr32(_ctrl, 0x1);
+		// Start only if no emergency raced with preparation/download. The
+		// check and control-register write are serialized with emergency_stop().
+		aborted = !start_run(run_epoch);
 
 		// main copying and reading loop
 		unsigned execution_loops = 0;
 		// track program counter execution
 		size_t pc_offset = 0, old_pc_hw = 0, old_pc = 0;
-		while (not finished) {
+		while (not finished && !aborted) {
+			if (run_aborted(run_epoch)) {
+				aborted = true;
+				break;
+			}
 			uint32_t exec = rd32(_exec);
 			uint32_t state = exec >> 24;
 			size_t pc_hw = (exec & 0xffffff) << 2; // convert to mem offset
+
+			if (report_armed && !armed_reported && state == MAR_STATE_TRIG_FOREVER) {
+				sa.send_intermediate_armed();
+				armed_reported = true;
+			}
 
 			if (pc_hw + 16 < old_pc_hw) {
 				// extra 16 since sometimes the PC can
@@ -480,6 +556,11 @@ int hardware::run_request(server_action &sa) {
 				}
 			}
 
+			if (run_aborted(run_epoch)) {
+				aborted = true;
+				break;
+			}
+
 			// Read out RX.  The normal path stores samples in fixed blocks; the
 			// chunk path keeps only its current pending chunk in vectors.
 			unsigned rx_locs = chunk_points > 0
@@ -524,12 +605,34 @@ int hardware::run_request(server_action &sa) {
 			++execution_loops;
 		}
 
-		// gracefully reset the FSM if no errors occurred
-		if (finished) {
-			wr32(_ctrl, 0x0);
-		// emergency halt the FSM and reset the hardware
+		// Do not let a stop that races normal completion get overwritten by
+		// the usual ctrl=idle write. An aborted request waits until the safe
+		// state has been fully established before its final reply is sent.
+		if (aborted) {
+			emergency_stop_result stop_result;
+			std::lock_guard<std::mutex> io_guard(_io_mutex);
+			force_safe_state(true, stop_result);
+		} else if (finished) {
+			std::lock_guard<std::mutex> io_guard(_io_mutex);
+			if (run_aborted(run_epoch)) {
+				aborted = true;
+				emergency_stop_result stop_result;
+				force_safe_state(true, stop_result);
+			} else {
+				wr32(_ctrl, 0x0);
+			}
+		// A non-stop execution failure still receives the established reset.
 		} else {
 			halt_and_reset();
+		}
+
+		// Stop may arrive just after the FPGA reaches HALT but before the final
+		// reply is encoded. It must still turn this request into an aborted run.
+		if (!aborted && run_aborted(run_epoch)) {
+			aborted = true;
+			emergency_stop_result stop_result;
+			std::lock_guard<std::mutex> io_guard(_io_mutex);
+			force_safe_state(true, stop_result);
 		}
 
 		// final buffer and gradient status checks
@@ -542,7 +645,9 @@ int hardware::run_request(server_action &sa) {
 		fhdo_err = fhdo_err | (status_latch & 0x4);
 
 		// post-mortem reporting
-		if (mem_buffer_underrun) {
+		if (aborted) {
+			sa.add_info("run_seq aborted by emergency stop");
+		} else if (mem_buffer_underrun) {
 			sprintf(t, "memory buffer underrun around byte address 0x%0zx", old_pc);
 			sa.add_error(t);
 		} else if (mem_buffer_low) {
@@ -579,7 +684,7 @@ int hardware::run_request(server_action &sa) {
 		// while (read_tries < _halt_tries_limit) {
 		// 	final_rx_read += read_rx(rx0_i, rx0_q, rx1_i, rx1_q);
 		// }
-		while (read_tries < 100) {
+		while (!aborted && read_tries < 100) {
 			final_rx_read += chunk_points > 0
 				? read_rx(rx0_i, rx0_q, rx1_i, rx1_q, 100)
 				: read_rx_to_blocks(100);
@@ -612,10 +717,25 @@ int hardware::run_request(server_action &sa) {
 
 		// halt();
 
+		if (!aborted && run_aborted(run_epoch)) {
+			aborted = true;
+			emergency_stop_result stop_result;
+			std::lock_guard<std::mutex> io_guard(_io_mutex);
+			force_safe_state(true, stop_result);
+		}
+
 		// encode the RX replies
 		size_t rx0_elem = chunk_points > 0 ? rx0_i.size() : rx0_blocks.size();
 		size_t rx1_elem = chunk_points > 0 ? rx1_i.size() : rx1_blocks.size();
-		if (chunk_points > 0) {
+		if (aborted) {
+			mpack_start_map(wr, 2);
+			mpack_write_cstr(wr, "final");
+			mpack_write(wr, true);
+			mpack_write_cstr(wr, "aborted");
+			mpack_write(wr, true);
+			mpack_finish_map(wr);
+			finish_run(run_epoch);
+		} else if (chunk_points > 0) {
 			// Chunked mode: intermediate chunks were flushed during the loop; emit the
 			// remaining (partial) chunk as the final chunk inside the normal reply so the
 			// client knows when the stream ends.
@@ -629,7 +749,7 @@ int hardware::run_request(server_action &sa) {
 				sa.add_warning(t);
 			}
 
-			mpack_start_map(wr, (rx0_rem ? 2 : 0) + (rx1_rem ? 2 : 0) + 2);
+			mpack_start_map(wr, (rx0_rem ? 2 : 0) + (rx1_rem ? 2 : 0) + 3);
 			if (rx0_rem) {
 				mpack_write_cstr(wr, "rx0_i");
 				mpack_start_array(wr, rx0_rem);
@@ -656,13 +776,66 @@ int hardware::run_request(server_action &sa) {
 			mpack_write(wr, (uint32_t)chunk_index);
 			mpack_write_cstr(wr, "final");
 			mpack_write(wr, true);
+			mpack_write_cstr(wr, "aborted");
+			// RX encoding can be long. Commit the abort flag only after all
+			// arrays have been encoded so a Stop during encoding is still seen.
+			mpack_write(wr, finish_run(run_epoch));
 			mpack_finish_map(wr);
+		} else if (structured_run) {
+			mpack_start_map(wr, (rx0_elem ? 2 : 0) + (rx1_elem ? 2 : 0) + 2);
+			if (rx0_elem) {
+				mpack_write_cstr(wr, "rx0_i");
+				mpack_start_array(wr, rx0_elem);
+				for (const auto &block_ptr : rx0_blocks.blocks()) {
+					const rx_block &block = *block_ptr;
+					for (size_t k = 0; k < block.used; ++k) mpack_write_int(wr, block.i[k]);
+				}
+				mpack_finish_array(wr);
+				mpack_write_cstr(wr, "rx0_q");
+				mpack_start_array(wr, rx0_elem);
+				for (const auto &block_ptr : rx0_blocks.blocks()) {
+					const rx_block &block = *block_ptr;
+					for (size_t k = 0; k < block.used; ++k) mpack_write_int(wr, block.q[k]);
+				}
+				mpack_finish_array(wr);
+			}
+			if (rx1_elem) {
+				mpack_write_cstr(wr, "rx1_i");
+				mpack_start_array(wr, rx1_elem);
+				for (const auto &block_ptr : rx1_blocks.blocks()) {
+					const rx_block &block = *block_ptr;
+					for (size_t k = 0; k < block.used; ++k) mpack_write_int(wr, block.i[k]);
+				}
+				mpack_finish_array(wr);
+				mpack_write_cstr(wr, "rx1_q");
+				mpack_start_array(wr, rx1_elem);
+				for (const auto &block_ptr : rx1_blocks.blocks()) {
+					const rx_block &block = *block_ptr;
+					for (size_t k = 0; k < block.used; ++k) mpack_write_int(wr, block.q[k]);
+				}
+				mpack_finish_array(wr);
+			}
+			mpack_write_cstr(wr, "final");
+			mpack_write(wr, true);
+			mpack_write_cstr(wr, "aborted");
+			mpack_write(wr, finish_run(run_epoch));
+			mpack_finish_map(wr);
+			if (!rx0_elem && !rx1_elem) sa.add_warning("no RX data received");
 		} else if (!rx0_elem and !rx1_elem) {
-			mpack_write(wr, c_ok);
-			sprintf(t, "no RX data received");
-			sa.add_warning(t);
+			if (finish_run(run_epoch)) {
+				mpack_start_map(wr, 2);
+				mpack_write_cstr(wr, "final");
+				mpack_write(wr, true);
+				mpack_write_cstr(wr, "aborted");
+				mpack_write(wr, true);
+				mpack_finish_map(wr);
+			} else {
+				mpack_write(wr, c_ok);
+				sprintf(t, "no RX data received");
+				sa.add_warning(t);
+			}
 		} else {
-			mpack_start_map(wr, (rx0_elem ? 2:0) + (rx1_elem ? 2:0) );
+			mpack_start_map(wr, (rx0_elem ? 2:0) + (rx1_elem ? 2:0) + 2);
 			if (rx0_elem) {
 				mpack_write_cstr(wr, "rx0_i");
 				mpack_start_array(wr, rx0_elem);
@@ -696,8 +869,13 @@ int hardware::run_request(server_action &sa) {
 				}
 				mpack_finish_array(wr);
 			}
+			mpack_write_cstr(wr, "final");
+			mpack_write(wr, true);
+			mpack_write_cstr(wr, "aborted");
+			mpack_write(wr, finish_run(run_epoch));
 
 			mpack_finish_map(wr);
+		}
 		}
 	}
 
@@ -728,6 +906,15 @@ int hardware::run_request(server_action &sa) {
 	if (status == 1) {
 		++commands_understood;
 		auto n_tests = mpack_node_u32(tbt);
+		if (_emergency_latched.load(std::memory_order_acquire)) {
+			sa.add_error("test_bus rejected while emergency stop is latched");
+			mpack_write(wr, c_err);
+		} else {
+		std::lock_guard<std::mutex> io_guard(_io_mutex);
+		if (_emergency_latched.load(std::memory_order_acquire)) {
+			sa.add_error("test_bus rejected while emergency stop is latched");
+			mpack_write(wr, c_err);
+		} else {
 
 		auto start_t = std::chrono::system_clock::now();
 		unsigned m = 0;
@@ -759,6 +946,8 @@ int hardware::run_request(server_action &sa) {
 		mpack_write(wr, read_ti);
 		mpack_write(wr, write_ti);
 		mpack_finish_array(wr);
+		}
+		}
 	}
 
 	// Determine if the server is running on hardware or just an emulation
@@ -848,31 +1037,9 @@ void hardware::init_mem() {
 }
 
 void hardware::halt() {
-	// Halt any currently-running sequence by halting FSM
-	wr32(_ctrl, 0x2); // set bit 1 to halt
-
-	// turn off readout
-	unsigned buf = 16; // buffer 16 = RX ctrl buffer index
-	unsigned val = 0x0000; // halt the RX
-	wr32(_direct, (buf << 24) | (val & 0xffff));
-
-	// Wait a while for all the output buffers to empty
-	unsigned k = 0;
-	while (k < _halt_tries_limit) {
-		if ( rd32(_buf_empty) == MAR_BUF_ALL_EMPTY ) break;
-		++k;
-	}
-
-	// Empty RX FIFOs (do this last)
-	if (rd32(_rx_locs)) { // nonzero number of elements in FIFOs
-		std::vector<uint32_t> rx0_i, rx0_q, rx1_i, rx1_q;  // throw away these vectors
-		read_rx(rx0_i, rx0_q, rx1_i, rx1_q);
-	}
-
-	while ( (rd32(_exec) >> 24 == MAR_STATE_COUNTDOWN) && k < _halt_tries_limit ) {
-		++k;
-	}
-	wr32(_ctrl, 0x0); // set FSM to idle (not explicitly halted)
+	emergency_stop_result result;
+	std::lock_guard<std::mutex> io_guard(_io_mutex);
+	force_safe_state(_emergency_latched.load(std::memory_order_acquire), result);
 }
 
 void hardware::halt_and_reset() {
@@ -881,15 +1048,203 @@ void hardware::halt_and_reset() {
 	_slcr[2] = 0xDF0D;
 	_slcr[92] = (_slcr[92] & ~0x03F03F30) | 0x00100700;
 
-	halt();
-	// TODO: write some immediate defaults to every buffer after
-	// it has emptied, in order of priority (i.e. first TX, next
-	// gradients)
+	emergency_stop_result result;
+	std::lock_guard<std::mutex> io_guard(_io_mutex);
+	force_safe_state(_emergency_latched.load(std::memory_order_acquire), result);
+}
 
-	// TODO: handle gradient reset in a clever way: set SPI
-	// divider to max, configure DAC boards, write a clear
-	// command. Should be independent of any previously-configured
-	// settings (i.e. do it for both potential GPA boards etc).
+emergency_stop_result hardware::emergency_stop(const std::string &gradient_board_name,
+                                               const std::string &acquisition_id) {
+	emergency_stop_result result;
+	std::lock_guard<std::mutex> io_guard(_io_mutex);
+	// Publishing cancellation and forcing safe MMIO are serialized with both
+	// start_run() and the normal FINISHED transition. Thus a racing ctrl=1 or
+	// ctrl=0 write can never occur after this stop has taken ownership.
+	_emergency_latched.store(true, std::memory_order_release);
+	_abort_epoch.fetch_add(1, std::memory_order_acq_rel);
+	remember_aborted_acquisition(acquisition_id);
+	if (!gradient_board_name.empty()) set_gradient_board(gradient_board_name);
+	force_safe_state(true, result);
+	return result;
+}
+
+bool hardware::prepare_run(bool rearm, const std::string &acquisition_id,
+                           uint64_t &run_epoch) {
+	std::lock_guard<std::mutex> io_guard(_io_mutex);
+	if (acquisition_was_aborted(acquisition_id)) return false;
+	run_epoch = _abort_epoch.load(std::memory_order_acquire);
+	if (_emergency_latched.load(std::memory_order_acquire) && !rearm) return false;
+	if (rearm) _emergency_latched.store(false, std::memory_order_release);
+	if (_abort_epoch.load(std::memory_order_acquire) != run_epoch ||
+	    _emergency_latched.load(std::memory_order_acquire)) return false;
+	return true;
+}
+
+bool hardware::acquisition_was_aborted(const std::string &acquisition_id) const {
+	if (acquisition_id.empty()) return false;
+	return _aborted_acquisition_ids.find(acquisition_id) !=
+	       _aborted_acquisition_ids.end();
+}
+
+void hardware::remember_aborted_acquisition(const std::string &acquisition_id) {
+	if (!acquisition_id.empty()) _aborted_acquisition_ids.insert(acquisition_id);
+}
+
+bool hardware::run_aborted(uint64_t run_epoch) const {
+	return _emergency_latched.load(std::memory_order_acquire) ||
+	       _abort_epoch.load(std::memory_order_acquire) != run_epoch;
+}
+
+bool hardware::start_run(uint64_t run_epoch) {
+	std::lock_guard<std::mutex> io_guard(_io_mutex);
+	if (run_aborted(run_epoch)) return false;
+	wr32(_ctrl, 0x1);
+	return true;
+}
+
+bool hardware::finish_run(uint64_t run_epoch) {
+	std::lock_guard<std::mutex> io_guard(_io_mutex);
+	return run_aborted(run_epoch);
+}
+
+void hardware::direct_write(unsigned buffer, uint16_t value) {
+	wr32(_direct, (buffer << 24) | value);
+	// Allow the direct-write pipeline to advance before a dependent write.
+	(void)rd32(_exec);
+	(void)rd32(_exec);
+}
+
+bool hardware::wait_for_fsm_idle() {
+	for (unsigned k = 0; k < _halt_tries_limit; ++k) {
+		if ((rd32(_exec) >> 24) == MAR_STATE_IDLE) return true;
+	}
+	return false;
+}
+
+bool hardware::wait_for_buffers_empty() {
+	for (unsigned k = 0; k < _halt_tries_limit; ++k) {
+		if (rd32(_buf_empty) == MAR_BUF_ALL_EMPTY) return true;
+	}
+	return false;
+}
+
+bool hardware::wait_for_gradient_idle(uint32_t status_mask) {
+	// The serializers are pipelined; do not mistake the pre-transfer idle
+	// value for completion of the direct command just issued.
+	(void)rd32(_status);
+	(void)rd32(_status);
+	for (unsigned k = 0; k < _gpa_idle_tries_limit; ++k) {
+		if ((rd32(_status) & status_mask) == 0) return true;
+	}
+	return false;
+}
+
+void hardware::zero_digital_outputs() {
+	// TX I/Q, external TX/RX gates + trigger, and both RX enables/resets.
+	for (unsigned buffer = 5; buffer <= 8; ++buffer) direct_write(buffer, 0);
+	direct_write(15, 0);
+	direct_write(16, 0);
+}
+
+bool hardware::zero_gradients() {
+	const gradient_board board = _gradient_board.load(std::memory_order_acquire);
+	const uint16_t slow_spi_div = 63;
+
+	if (board == gradient_board::ocra1 || board == gradient_board::ocra1_5761) {
+		// Buffer-empty only says MaRGA has handed off the final word.  The
+		// OCRA serializer may still be clocking that word, and it has no queue
+		// for a broadcast received while busy.  Do not issue the zero frame
+		// until the previous SPI transaction has completed.
+		if (!wait_for_gradient_idle(0x00010000u)) return false;
+
+		// Enable OCRA1, release its serializer reset, and trigger only from
+		// LSB writes. The final channel word carries the broadcast bit.
+		direct_write(0, (1u << 0) | (slow_spi_div << 2) | (1u << 8));
+		const uint32_t zero_payload = board == gradient_board::ocra1
+			? 0x00100000u : 0x00030000u;
+		for (unsigned channel = 0; channel < 4; ++channel) {
+			uint32_t word = zero_payload | (channel << 25);
+			if (channel == 3) word |= (1u << 24);
+			direct_write(2, (uint16_t)(word >> 16));
+			direct_write(1, (uint16_t)word);
+		}
+		bool idle = wait_for_buffers_empty() && wait_for_gradient_idle(0x00010000u);
+		direct_write(0, 0);
+		return idle;
+	}
+
+	if (board == gradient_board::gpa_fhdo) {
+		// Like OCRA, GPA-FHDO accepts a new word only while its serializer is
+		// idle.  Otherwise the first channel's zero command could be dropped.
+		if (!wait_for_gradient_idle(0x00020000u)) return false;
+
+		// GPA-FHDO zero current is the midpoint DAC code (0x8000), written
+		// explicitly to all four DAC input registers.
+		direct_write(0, (2u << 0) | (slow_spi_div << 2));
+		bool idle = true;
+		for (unsigned channel = 0; channel < 4; ++channel) {
+			uint32_t word = ((0x8u + channel) << 16) | 0x8000u;
+			direct_write(2, (uint16_t)(word >> 16));
+			direct_write(1, (uint16_t)word);
+			idle = wait_for_buffers_empty() &&
+			       wait_for_gradient_idle(0x00020000u) && idle;
+		}
+		direct_write(0, 0);
+		return idle;
+	}
+
+	// Sending a command for the wrong DAC type can itself be unsafe. New
+	// clients therefore identify the board in each structured run_seq.
+	direct_write(0, 0);
+	return false;
+}
+
+bool hardware::drain_rx_fifos() {
+	for (unsigned pass = 0; pass < 8; ++pass) {
+		uint32_t locs = rd32(_rx_locs);
+		unsigned fifo0_locs = locs & 0xffffu;
+		unsigned fifo1_locs = locs >> 16;
+		if (fifo0_locs == 0 && fifo1_locs == 0) return true;
+		while (fifo0_locs-- > 0) {
+			(void)rd32(_rx0_q_data);
+			(void)rd32(_rx0_i_data);
+		}
+		while (fifo1_locs-- > 0) {
+			(void)rd32(_rx1_q_data);
+			(void)rd32(_rx1_i_data);
+		}
+	}
+	return rd32(_rx_locs) == 0;
+}
+
+void hardware::force_safe_state(bool keep_stop_latched, emergency_stop_result &result) {
+	wr32(_ctrl, 0x2);
+	result.fsm_idle = wait_for_fsm_idle();
+
+	// Direct writes are accepted in IDLE. Write the digital zeros once as
+	// early as possible, then again after every queued buffer value is gone.
+	if (result.fsm_idle) zero_digital_outputs();
+	bool old_buffers_empty = wait_for_buffers_empty();
+	if (result.fsm_idle && old_buffers_empty) zero_digital_outputs();
+	bool zero_buffers_empty = wait_for_buffers_empty();
+	result.gradients_zeroed = result.fsm_idle && old_buffers_empty &&
+	                          zero_buffers_empty && zero_gradients();
+	if (result.fsm_idle && old_buffers_empty) zero_digital_outputs();
+	bool final_buffers_empty = wait_for_buffers_empty();
+	result.digital_outputs_zeroed = result.fsm_idle && old_buffers_empty &&
+	                                zero_buffers_empty && final_buffers_empty;
+	result.rx_fifo_empty = drain_rx_fifos();
+
+	// ctrl=2 remains asserted for an emergency latch. The next run_seq must
+	// explicitly rearm before start_run() can replace it with ctrl=1.
+	wr32(_ctrl, keep_stop_latched ? 0x2 : 0x0);
+}
+
+void hardware::set_gradient_board(const std::string &name) {
+	if (name == "ocra1") _gradient_board.store(gradient_board::ocra1, std::memory_order_release);
+	else if (name == "ocra1_5761" || name == "ocra1-5761") _gradient_board.store(gradient_board::ocra1_5761, std::memory_order_release);
+	else if (name == "gpa-fhdo" || name == "gpa_fhdo") _gradient_board.store(gradient_board::gpa_fhdo, std::memory_order_release);
+	else _gradient_board.store(gradient_board::unknown, std::memory_order_release);
 }
 
 unsigned hardware::read_rx(std::vector<uint32_t> &rx0_i, std::vector<uint32_t> &rx0_q,
