@@ -356,28 +356,53 @@ void iface::run_stream() {
 			fprintf(stderr, "[%s line %d] socket accept failed\n", __FILE__, __LINE__);
 			continue;
 		}
-		{
-			std::lock_guard<std::mutex> guard(_connections_mutex);
-			_connection_fds.insert(connection_fd);
-		}
+		// Workers may have finished while accept() was waiting. Reclaim their
+		// stacks before allocating another one; never wait for an active scan.
+		reap_connection_threads();
 		try {
-			// This must remain asynchronous: a run_seq connection can block while
-			// an independently accepted emergency-stop connection is handled.
-			// Do not use detach() here; it is broken by the target's static C++
-			// thread runtime even though thread construction succeeds.
-			_connection_threads.emplace_back(&iface::handle_connection, this,
-			                                 connection_fd);
-		} catch (const std::system_error &) {
+			// Allocate the record before starting a thread. Otherwise an allocation
+			// failure could destroy a temporary joinable thread and terminate us.
+			_connection_threads.emplace_back();
+			connection_worker &worker = _connection_threads.back();
+			try {
+				{
+					std::lock_guard<std::mutex> guard(_connections_mutex);
+					_connection_fds.insert(connection_fd);
+				}
+				// Keep this asynchronous so a separate emergency-stop connection
+				// can interrupt a blocked run_seq. Keep workers joinable for shutdown.
+				worker.thread = std::thread([this, connection_fd, &worker]() {
+					handle_connection(connection_fd);
+					worker.finished.store(true, std::memory_order_release);
+				});
+			} catch (...) {
+				// Registration or thread construction failed; no worker was started.
+				_connection_threads.pop_back();
+				throw;
+			}
+		} catch (const std::exception &error) {
 			connection_finished(connection_fd);
 			close(connection_fd);
+			fprintf(stderr, "Could not start connection worker: %s\n", error.what());
 		}
 	}
 
 	stop_other_connections(-1);
-	for (std::thread &connection_thread : _connection_threads) {
-		if (connection_thread.joinable()) connection_thread.join();
+	reap_connection_threads(true);
+}
+
+void iface::reap_connection_threads(bool join_all) {
+	// Only the accept loop owns this list. Workers only set their own flag,
+	// after handle_connection has closed the socket and released its buffers.
+	// Do not hold _connections_mutex across join(): cleanup also needs it.
+	for (auto worker = _connection_threads.begin(); worker != _connection_threads.end();) {
+		if (!join_all && !worker->finished.load(std::memory_order_acquire)) {
+			++worker;
+			continue;
+		}
+		if (worker->thread.joinable()) worker->thread.join();
+		worker = _connection_threads.erase(worker);
 	}
-	_connection_threads.clear();
 }
 
 void iface::handle_connection(int connection_fd) {

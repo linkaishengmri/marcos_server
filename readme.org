@@ -19,4 +19,8 @@ On the SDRLab, inside the repo after cloning and choosing the right branch:
   make -j4
 #+END_SRC
 
+The ARM build links the full static pthread archive. Keep this linker setting:
+on the target GCC runtime, linking only =-lpthread= can allow thread creation
+while =std::thread::join()= fails and terminates the server.
+
 Have a look at the [[https://github.com/vnegnev/marcos_extras/wiki][MaRCoS wiki]] for additional information.

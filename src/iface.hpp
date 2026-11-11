@@ -27,6 +27,7 @@ extern "C" {
 #include "mpack/mpack.h"
 #include <atomic>
 #include <cstdint>
+#include <list>
 #include <mutex>
 #include <set>
 #include <string>
@@ -173,13 +174,19 @@ private:
 	int _server_fd;
 	std::mutex _connections_mutex;
 	std::set<int> _connection_fds;
-	// Do not detach connection workers.  The statically linked libstdc++ on
-	// the deployed Red Pitaya can create a std::thread but throws from
-	// std::thread::detach().  Keeping the handles also lets run_stream() join
-	// every worker after the listening socket has been shut down.
-	std::vector<std::thread> _connection_threads;
+	struct connection_worker {
+		std::thread thread;
+		std::atomic<bool> finished{false};
+	};
+	// Keep workers joinable: shutdown must wait for them before hardware is
+	// destroyed. Reap completed workers during normal operation so their
+	// stacks do not accumulate. List nodes stay at a stable address while
+	// workers publish their completion flags. The ARM static build must link
+	// the full pthread archive (see CMakeLists.txt) for join() to work.
+	std::list<connection_worker> _connection_threads;
 
 	void handle_connection(int connection_fd);
+	void reap_connection_threads(bool join_all = false);
 	void connection_finished(int connection_fd);
 	void stop_other_connections(int except_fd);
 };
